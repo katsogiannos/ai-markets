@@ -1,144 +1,163 @@
-import os
+# app/main.py
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel
+from openai import OpenAI
+import os
 
 app = FastAPI(title="AI Markets")
 
-# CORS (για να παίζει ο web client)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------
+# Helpers
+# ---------------------------
+def _get_openai_key() -> str:
+    # Δοκιμάζουμε τα πιο συνηθισμένα ονόματα ENV για το κλειδί
+    return (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPEN_AI_KEY")
+        or os.getenv("OPENAIKEY")
+        or ""
+    )
 
-# Διαβάζουμε key από διάφορες πιθανές μεταβλητές περιβάλλοντος
-OPENAI_KEY = (
-    os.getenv("OPENAI_API_KEY")
-    or os.getenv("OPEN_AI_KEY")
-    or os.getenv("OPENAIKEY")
-    or ""
-)
+def _make_client() -> OpenAI:
+    key = _get_openai_key()
+    if not key:
+        raise RuntimeError(
+            "Missing OpenAI API key (set OPENAI_API_KEY ή OPEN_AI_KEY στο Render → Environment)."
+        )
+    return OpenAI(api_key=key)
 
-@app.get("/healthz")
-def health():
+# ---------------------------
+# DTOs
+# ---------------------------
+class AskPayload(BaseModel):
+    question: str
+
+# ---------------------------
+# Routes
+# ---------------------------
+@app.get("/healthz", response_class=JSONResponse)
+def healthz():
     return {"ok": True}
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """
-    <h2>AI Markets is running.</h2>
-    <p>Try: <a href="/healthz">/healthz</a>, <a href="/advisor">/advisor</a></p>
-    """
+    return """\
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>AI Markets</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:900px}
+    textarea,input,button{font:inherit}
+    textarea{width:100%;height:180px;padding:10px}
+    .row{display:grid;gap:10px}
+    .card{border:1px solid #ddd;border-radius:8px;padding:16px}
+    pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;color:#e6edf3;padding:12px;border-radius:8px}
+    .muted{color:#666}
+  </style>
+</head>
+<body>
+  <h1>AI Markets is running.</h1>
+  <p class="muted">Try: <a href="/healthz">/healthz</a> · <a href="/advisor">/advisor</a></p>
+</body>
+</html>
+"""
 
-# Πολύ απλό UI για ελεύθερο prompt
 @app.get("/advisor", response_class=HTMLResponse)
 def advisor_page():
-    return """
+    # Απλή σελίδα όπου ο χρήστης γράφει ελεύθερα την ερώτηση
+    return """\
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
+  <meta charset="utf-8"/>
   <title>AI Markets Advisor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body{font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 16px}
-    textarea,input,button{font:inherit}
-    textarea{width:100%;min-height:120px;padding:10px}
-    .row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
-    button{padding:10px 16px}
-    pre{background:#111;color:#eee;padding:14px;border-radius:6px;white-space:pre-wrap}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:920px}
+    textarea,button{font:inherit}
+    textarea{width:100%;height:200px;padding:10px}
+    button{padding:10px 16px;border:1px solid #444;border-radius:6px;background:#111;color:#fff;cursor:pointer}
+    .card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-top:20px}
+    pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;color:#e6edf3;padding:12px;border-radius:8px}
   </style>
 </head>
 <body>
   <h1>AI Markets Advisor</h1>
   <p>Type anything you want (free text). This is educational, not financial advice.</p>
-  <textarea id="q" placeholder="Where should I invest today?"></textarea>
-  <div class="row">
-    <small id="status"></small>
-    <button id="btn">Analyze</button>
+
+  <div class="card">
+    <textarea id="q" placeholder="WHERE SHOULD I INVEST TODAY?"></textarea>
+    <div style="margin-top:10px">
+      <button id="btn">Analyze</button>
+    </div>
+    <div class="card" id="out" style="display:none">
+      <h3>Result</h3>
+      <pre id="res"></pre>
+    </div>
   </div>
-  <h3>Result</h3>
-  <pre id="out"></pre>
 
 <script>
-  const btn = document.getElementById('btn');
-  const q = document.getElementById('q');
-  const out = document.getElementById('out');
-  const status = document.getElementById('status');
+const btn = document.getElementById('btn');
+const q = document.getElementById('q');
+const out = document.getElementById('out');
+const res = document.getElementById('res');
 
-  btn.onclick = async () => {
-    out.textContent = '';
-    status.textContent = 'Working...';
-    try {
-      const res = await fetch('/chat', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({message: q.value})
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || res.statusText);
-      out.textContent = data.answer;
-    } catch (e) {
-      out.textContent = 'Error: ' + e.message;
-    } finally {
-      status.textContent = '';
-    }
-  };
+btn.onclick = async () => {
+  res.textContent = 'Working...';
+  out.style.display = 'block';
+  try {
+    const r = await fetch('/api/advisor', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({question: q.value || ''})
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || JSON.stringify(data));
+    res.textContent = data.answer || JSON.stringify(data, null, 2);
+  } catch (err) {
+    res.textContent = 'Error: ' + err.message;
+  }
+};
 </script>
 </body>
 </html>
+"""
+
+@app.post("/api/advisor", response_class=JSONResponse)
+def advisor_api(payload: AskPayload):
     """
-
-@app.post("/chat")
-async def chat(req: Request):
+    Δέχεται ελεύθερο κείμενο από τον χρήστη και ζητά περίληψη/πρόταση από το OpenAI.
+    (Αυστηρά για educational use — όχι επενδυτική συμβουλή.)
     """
-    Δέχεται: {"message": "..."} και επιστρέφει {"answer": "..."}.
-    Αν υπάρχει OpenAI key, καλεί OpenAI. Αλλιώς, κάνει safe fallback.
-    """
-    body = await req.json()
-    user_msg = (body or {}).get("message", "").strip()
-
-    if not user_msg:
-        return JSONResponse({"detail": "Empty message."}, status_code=400)
-
-    # Αν δεν υπάρχει key, απαντάμε απλά για να μην σκάει.
-    if not OPENAI_KEY:
-        demo = (
-            "⚠️ No OpenAI key configured on server.\n\n"
-            "Echo of your request:\n---\n"
-            f"{user_msg}\n---\n\n"
-            "Add OPENAI_API_KEY (or OPEN_AI_KEY / OPENAIKEY) in Render → Environment."
-        )
-        return {"answer": demo}
-
-    # Κλήση OpenAI Responses API (stream=false)
     try:
-        payload = {
-            "model": "gpt-5-mini",
-            "input": f"You are a cautious markets research assistant. "
-                     f"Answer concisely and clearly. The user asked:\n{user_msg}"
-        }
-        headers = {
-            "Authorization": f"Bearer {OPENAI_KEY}",
-            "Content-Type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post("https://api.openai.com/v1/responses", json=payload, headers=headers)
-            if r.status_code != 200:
-                return JSONResponse({"detail": f"OpenAI error: {r.text}"}, status_code=502)
-            data = r.json()
-            # Προσπαθούμε να διαβάσουμε ένα απλό text απόκρισης
-            # (το schema των responses μπορεί να έχει 'output_text' ή 'choices' ανάλογα με το μοντέλο).
-            text = (
-                data.get("output_text")
-                or (data.get("choices") or [{}])[0].get("message", {}).get("content")
-                or str(data)
-            )
-            return {"answer": text}
+        question = (payload.question or "").strip()
+        if not question:
+            return JSONResponse({"detail": "Please provide a question."}, status_code=400)
+
+        client = _make_client()
+
+        system = (
+            "You are an investment research assistant. "
+            "Provide careful, cautious, educational analysis. "
+            "Avoid giving financial advice; emphasize risks and disclaimers."
+        )
+        user = f"User question:\n{question}\n\nReturn a concise, structured answer in English."
+
+        # OpenAI Responses API (SDK v1+)
+        resp = client.responses.create(
+            model="gpt-5-mini",
+            input=[{"role":"system","content":system},{"role":"user","content":user}],
+            # Optional: small guardrails to keep it short and crisp
+            max_output_tokens=600,
+        )
+        answer = getattr(resp, "output_text", None) or "No answer."
+
+        return {"answer": answer}
+
     except Exception as e:
+        # Επιστρέφουμε το error για debugging στο UI
         return JSONResponse({"detail": f"AI error: {e}"}, status_code=500)
-
-

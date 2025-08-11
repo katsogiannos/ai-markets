@@ -1,163 +1,190 @@
-# app/main.py
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel
-from openai import OpenAI
 import os
+import json
+import logging
+from typing import Any, Dict
 
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+
+# -----------------------
+# Logging (για debug στο Render)
+# -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("aimarkets")
+
+# -----------------------
+# FastAPI app
+# -----------------------
 app = FastAPI(title="AI Markets")
 
-# ---------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------
+# Environment variables
+# -----------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # προετοιμασμένο για /news όταν το ανοίξουμε
+
+log.info("ENV CHECK | OPENAI_API_KEY present? %s", bool(OPENAI_API_KEY))
+log.info("ENV CHECK | NEWS_API_KEY present? %s", bool(NEWS_API_KEY))
+
+# -----------------------
 # Helpers
-# ---------------------------
-def _get_openai_key() -> str:
-    # Δοκιμάζουμε τα πιο συνηθισμένα ονόματα ENV για το κλειδί
-    return (
-        os.getenv("OPENAI_API_KEY")
-        or os.getenv("OPEN_AI_KEY")
-        or os.getenv("OPENAIKEY")
-        or ""
-    )
+# -----------------------
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-3.5-turbo"  # σταθερό και διαθέσιμο
 
-def _make_client() -> OpenAI:
-    key = _get_openai_key()
-    if not key:
-        raise RuntimeError(
-            "Missing OpenAI API key (set OPENAI_API_KEY ή OPEN_AI_KEY στο Render → Environment)."
-        )
-    return OpenAI(api_key=key)
+async def call_openai_chat(query: str) -> str:
+    """
+    Κλήση στο OpenAI Chat Completions API με httpx.
+    Επιστρέφει μόνο το text (assistant message) ή πετάει HTTPException.
+    """
+    if not OPENAI_API_KEY:
+        log.error("OPENAI_API_KEY is missing in environment.")
+        raise HTTPException(status_code=500, detail="Server is not configured with OpenAI API key.")
 
-# ---------------------------
-# DTOs
-# ---------------------------
-class AskPayload(BaseModel):
-    question: str
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful, cautious financial research assistant. You never give financial advice; only educational analysis."},
+            {"role": "user", "content": query},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 800,
+    }
 
-# ---------------------------
+    log.info("OPENAI CALL | sending request…")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(OPENAI_URL, headers=headers, json=payload)
+    except httpx.RequestError as e:
+        log.exception("OPENAI CALL | network error: %s", str(e))
+        raise HTTPException(status_code=502, detail="Connection error to OpenAI.")
+
+    if resp.status_code >= 400:
+        # γράφουμε το body στα logs για troubleshooting
+        try:
+            err_body = resp.json()
+        except Exception:
+            err_body = {"raw": resp.text}
+        log.error("OPENAI CALL | HTTP %s | %s", resp.status_code, err_body)
+        # Μην επιστρέφεις το κλειδί/headers – μόνο γενικό σφάλμα στον χρήστη
+        raise HTTPException(status_code=502, detail="OpenAI returned an error.")
+
+    data = resp.json()
+    log.info("OPENAI CALL | ok.")
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        log.error("OPENAI CALL | unexpected response shape: %s", json.dumps(data)[:800])
+        raise HTTPException(status_code=502, detail="Unexpected response from OpenAI.")
+
+# -----------------------
 # Routes
-# ---------------------------
-@app.get("/healthz", response_class=JSONResponse)
-def healthz():
+# -----------------------
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return """
+    <h2>AI Markets is running.</h2>
+    <p>Try: <a href="/healthz">/healthz</a> · <a href="/advisor">/advisor</a></p>
+    """
+
+@app.get("/healthz")
+async def healthz():
     return {"ok": True}
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """\
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <title>AI Markets</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:900px}
-    textarea,input,button{font:inherit}
-    textarea{width:100%;height:180px;padding:10px}
-    .row{display:grid;gap:10px}
-    .card{border:1px solid #ddd;border-radius:8px;padding:16px}
-    pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;color:#e6edf3;padding:12px;border-radius:8px}
-    .muted{color:#666}
-  </style>
-</head>
-<body>
-  <h1>AI Markets is running.</h1>
-  <p class="muted">Try: <a href="/healthz">/healthz</a> · <a href="/advisor">/advisor</a></p>
-</body>
-</html>
-"""
-
+# --- Advisor UI (free text) ---
+# Απλή σελίδα HTML (χωρίς templates) που καλεί το /api/advice
 @app.get("/advisor", response_class=HTMLResponse)
-def advisor_page():
-    # Απλή σελίδα όπου ο χρήστης γράφει ελεύθερα την ερώτηση
-    return """\
+async def advisor_page():
+    return """
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-  <meta charset="utf-8"/>
+  <meta charset="utf-8" />
   <title>AI Markets Advisor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:40px;max-width:920px}
-    textarea,button{font:inherit}
-    textarea{width:100%;height:200px;padding:10px}
-    button{padding:10px 16px;border:1px solid #444;border-radius:6px;background:#111;color:#fff;cursor:pointer}
-    .card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-top:20px}
-    pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;color:#e6edf3;padding:12px;border-radius:8px}
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 28px; max-width: 980px; margin: 0 auto; }
+    h1 { margin: 0 0 12px 0; }
+    textarea { width: 100%; height: 220px; font-family: inherit; font-size: 15px; padding: 10px; }
+    button { padding: 10px 18px; font-size: 14px; cursor: pointer; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px; margin-top: 18px; background: #fafafa; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 10px; overflow: auto; border-radius: 8px; }
+    .muted { color: #6b7280; font-size: 13px; }
   </style>
 </head>
 <body>
   <h1>AI Markets Advisor</h1>
-  <p>Type anything you want (free text). This is educational, not financial advice.</p>
+  <p class="muted">Type anything you want (free text). This is educational, not financial advice.</p>
+  <textarea id="q" placeholder="Where should I invest today?"></textarea>
+  <br/><br/>
+  <button onclick="run()">Analyze</button>
 
   <div class="card">
-    <textarea id="q" placeholder="WHERE SHOULD I INVEST TODAY?"></textarea>
-    <div style="margin-top:10px">
-      <button id="btn">Analyze</button>
-    </div>
-    <div class="card" id="out" style="display:none">
-      <h3>Result</h3>
-      <pre id="res"></pre>
-    </div>
+    <div class="muted">Result</div>
+    <pre id="out"></pre>
   </div>
 
 <script>
-const btn = document.getElementById('btn');
-const q = document.getElementById('q');
-const out = document.getElementById('out');
-const res = document.getElementById('res');
-
-btn.onclick = async () => {
-  res.textContent = 'Working...';
-  out.style.display = 'block';
+async function run() {
+  const out = document.getElementById('out');
+  const q = document.getElementById('q').value.trim();
+  out.textContent = 'Working...';
   try {
-    const r = await fetch('/api/advisor', {
+    const r = await fetch('/api/advice', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({question: q.value || ''})
+      body: JSON.stringify({ query: q })
     });
     const data = await r.json();
-    if (!r.ok) throw new Error(data.detail || JSON.stringify(data));
-    res.textContent = data.answer || JSON.stringify(data, null, 2);
-  } catch (err) {
-    res.textContent = 'Error: ' + err.message;
+    if (r.ok) {
+      out.textContent = data.result || '';
+    } else {
+      out.textContent = 'Error: ' + (data.detail || data.error || 'unknown error');
+    }
+  } catch (e) {
+    out.textContent = 'Error: ' + e.toString();
   }
-};
+}
 </script>
 </body>
 </html>
-"""
-
-@app.post("/api/advisor", response_class=JSONResponse)
-def advisor_api(payload: AskPayload):
     """
-    Δέχεται ελεύθερο κείμενο από τον χρήστη και ζητά περίληψη/πρόταση από το OpenAI.
-    (Αυστηρά για educational use — όχι επενδυτική συμβουλή.)
-    """
-    try:
-        question = (payload.question or "").strip()
-        if not question:
-            return JSONResponse({"detail": "Please provide a question."}, status_code=400)
 
-        client = _make_client()
+# --- Advisor API ---
+@app.post("/api/advice")
+async def api_advice(payload: Dict[str, Any]):
+    query = (payload or {}).get("query", "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Empty query.")
+    log.info("ADVICE | query: %s", query[:200])
+    text = await call_openai_chat(query)
+    # Μικρή καθαριότητα του κειμένου
+    return JSONResponse({"result": text.strip()})
 
-        system = (
-            "You are an investment research assistant. "
-            "Provide careful, cautious, educational analysis. "
-            "Avoid giving financial advice; emphasize risks and disclaimers."
-        )
-        user = f"User question:\n{question}\n\nReturn a concise, structured answer in English."
+# -----------------------
+# Error handlers (πιο καθαρά μηνύματα)
+# -----------------------
+@app.exception_handler(HTTPException)
+async def http_exc_handler(_, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-        # OpenAI Responses API (SDK v1+)
-        resp = client.responses.create(
-            model="gpt-5-mini",
-            input=[{"role":"system","content":system},{"role":"user","content":user}],
-            # Optional: small guardrails to keep it short and crisp
-            max_output_tokens=600,
-        )
-        answer = getattr(resp, "output_text", None) or "No answer."
+@app.exception_handler(Exception)
+async def unhandled_exc_handler(_, exc: Exception):
+    log.exception("UNHANDLED | %s", str(exc))
+    return JSONResponse(status_code=500, content={"detail": "Server error."})
 
-        return {"answer": answer}
-
-    except Exception as e:
-        # Επιστρέφουμε το error για debugging στο UI
-        return JSONResponse({"detail": f"AI error: {e}"}, status_code=500)

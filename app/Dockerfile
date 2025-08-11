@@ -1,13 +1,17 @@
-FROM python:3.11-slim
+# Χρησιμοποιούμε Python 3.11
+FROM python:3.11
 
+# Ορίζουμε φάκελο εργασίας
 WORKDIR /app
 
+# Αντιγράφουμε το requirements.txt
 COPY requirements.txt .
+
+# Εγκαθιστούμε dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app /app
+# Αντιγράφουμε όλο τον κώδικα
+COPY . /app
 
-# Render gives PORT env; default 10000 for local sanity.
-EXPOSE 10000
-
-CMD ["sh","-c","uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Τρέχουμε την εφαρμογή
+CMD ["python", "main.py"]

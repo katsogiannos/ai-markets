@@ -1,143 +1,162 @@
-from fastapi import FastAPI, HTTPException
+import os
+import json
+from typing import List, Optional, Dict, Any
+import requests
+import yfinance as yf
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx, yfinance as yf
-from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-app = FastAPI(title="AI Markets – MVP")
+# Load .env only for local runs (Render διαβάζει από env vars)
+load_dotenv()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---- Keys (υποστήριξη και των δύο ονομάτων) ----
+OPENAI_API_KEY = os.getenv("OPENAIKEY") or os.getenv("OPENAI_API_KEY")
+NEWS_API_KEY   = os.getenv("NEWSAPIKEY") or os.getenv("NEWS_API_KEY")
 
-@app.get("/healthz")
-def health():
-    return {"ok": True}
+# ---- OpenAI client (new SDK) ----
+try:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    openai_client = None
 
+app = FastAPI(title="AI Markets", version="1.0.0")
+
+# -----------------------
+# Helpers
+# -----------------------
+def coingecko_price(ids: List[str], vs: str = "usd") -> Dict[str, Any]:
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": ",".join(ids), "vs_currencies": vs}
+    r = requests.get(url, params=params, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(502, f"CoinGecko error: {r.text}")
+    return r.json()
+
+def yahoo_last_close(ticker: str) -> Optional[float]:
+    data = yf.Ticker(ticker).history(period="1d")
+    if data is None or data.empty:
+        return None
+    return float(data["Close"].iloc[-1])
+
+def newsapi_top_business(limit: int = 10, lang: str = "en") -> List[Dict[str, Any]]:
+    if not NEWS_API_KEY:
+        return []
+    url = "https://newsapi.org/v2/top-headlines"
+    params = {"category": "business", "language": lang, "pageSize": limit, "apiKey": NEWS_API_KEY}
+    r = requests.get(url, params=params, timeout=15)
+    if r.status_code != 200:
+        return []
+    return (r.json().get("articles") or [])[:limit]
+
+def ai_summarize(payload: Dict[str, Any]) -> str:
+    if not openai_client:
+        return "AI is not configured (missing OPENAIKEY/OPENAI_API_KEY)."
+    prompt = (
+        "Summarize concisely the following market snapshot in English. "
+        "Give 3–5 bullet points and one short outlook sentence. "
+        "Data:\n" + json.dumps(payload, ensure_ascii=False)
+    )
+    try:
+        resp = openai_client.responses.create(
+            model="gpt-5-mini",
+            input=prompt,
+        )
+        return resp.output_text.strip() if hasattr(resp, "output_text") else "No AI output."
+    except Exception as e:
+        return f"AI error: {e}"
+
+# -----------------------
+# Routes
+# -----------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return "It works ✅"
+    return "<h2>AI Markets is running.</h2><p>Try: /healthz, /crypto/price/bitcoin, /stock/price/AAPL, /news, /dashboard</p>"
 
-# ---------- Helpers ----------
-def _ts_to_ms(ts: datetime) -> int:
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return int(ts.timestamp() * 1000)
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
-def yf_last_price(symbol: str):
-    """Πάρε τιμή με 2 προσπάθειες: fast_info -> history."""
-    t = yf.Ticker(symbol)
-    # 1) fast_info
-    try:
-        fi = t.fast_info
-        p = fi.get("last_price")
-        if p is not None:
-            return float(p), fi.get("currency", "USD")
-    except Exception:
-        pass
-    # 2) τελευταία τιμή από history
-    try:
-        h = t.history(period="1d", interval="1d", auto_adjust=False, actions=False)
-        if h is not None and not h.empty:
-            return float(h["Close"][-1]), "USD"
-    except Exception:
-        pass
-    raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή.")
+# Crypto
+@app.get("/crypto/price/{coin_id}")
+def crypto_price(coin_id: str, vs: str = "usd"):
+    data = coingecko_price([coin_id], vs)
+    if coin_id not in data:
+        raise HTTPException(404, f"No price for '{coin_id}'.")
+    return {coin_id: data[coin_id]}
 
-# ---------- Crypto (CoinGecko) ----------
-@app.get("/crypto/price/{symbol}")
-async def crypto_price(symbol: str):
-    mapping = {
-        "btc": "bitcoin", "bitcoin": "bitcoin",
-        "eth": "ethereum", "ethereum": "ethereum",
-        "sol": "solana", "solana": "solana",
-        "ada": "cardano", "cardano": "cardano",
-        "xrp": "ripple",  "ripple": "ripple",
-    }
-    coin_id = mapping.get(symbol.lower())
-    if not coin_id:
-        raise HTTPException(status_code=400, detail="Υποστήριξη: BTC, ETH, SOL, ADA, XRP.")
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": coin_id, "vs_currencies": "usd"}
-    headers = {
-        # Κάποιοι providers θέλουν User-Agent
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10, headers=headers) as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-    except httpx.HTTPError:
-        raise HTTPException(status_code=502, detail="CoinGecko πρόβλημα.")
-    price = data.get(coin_id, {}).get("usd")
+@app.get("/crypto/prices")
+def crypto_prices(ids: str = "bitcoin,ethereum,solana", vs: str = "usd"):
+    id_list = [x.strip() for x in ids.split(",") if x.strip()]
+    return coingecko_price(id_list, vs)
+
+# Stocks / ETFs
+@app.get("/stock/price/{ticker}")
+def stock_price(ticker: str):
+    price = yahoo_last_close(ticker)
     if price is None:
-        raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή.")
-    return {"symbol": symbol.upper(), "usd": price}
+        raise HTTPException(404, f"No price for '{ticker}'.")
+    return {"ticker": ticker.upper(), "close": price}
 
-# ---------- Stocks / ETFs ----------
-@app.get("/stock/price/{symbol}")
-def stock_price(symbol: str):
-    price, ccy = yf_last_price(symbol.upper())
-    return {"symbol": symbol.upper(), "price": price, "currency": ccy}
+# News
+@app.get("/news")
+def top_news(limit: int = 10, lang: str = "en"):
+    articles = newsapi_top_business(limit=limit, lang=lang)
+    slim = [
+        {
+            "title": a.get("title"),
+            "source": (a.get("source") or {}).get("name"),
+            "url": a.get("url"),
+            "publishedAt": a.get("publishedAt"),
+        }
+        for a in articles
+    ]
+    return {"count": len(slim), "articles": slim}
 
-@app.get("/stock/candles/{symbol}")
-def stock_candles(symbol: str, interval: str = "1d", range: str = "1mo"):
-    """
-    interval: 1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo
-    range: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
-    """
-    sym = symbol.upper()
-    # δοκίμασε history (πιο αξιόπιστο στο Render)
+# AI summary for arbitrary payload
+@app.post("/ai/summary")
+def ai_summary(body: Dict[str, Any] = Body(...)):
+    text = ai_summarize(body)
+    return {"summary": text}
+
+# Combined dashboard
+@app.get("/dashboard")
+def dashboard(
+    coins: str = "bitcoin,ethereum,solana",
+    tickers: str = "AAPL,MSFT,SPY",
+    news_limit: int = 5,
+    lang: str = "en",
+):
+    # Crypto
+    coin_ids = [x.strip() for x in coins.split(",") if x.strip()]
     try:
-        df = yf.Ticker(sym).history(period=range, interval=interval, auto_adjust=False, actions=False)
-    except Exception:
-        df = None
-    if df is None or df.empty:
-        # δεύτερη προσπάθεια με download
+        crypto = coingecko_price(coin_ids, "usd")
+    except HTTPException:
+        crypto = {}
+
+    # Stocks
+    result_stocks = {}
+    for t in [x.strip().upper() for x in tickers.split(",") if x.strip()]:
         try:
-            df = yf.download(sym, period=range, interval=interval, progress=False, threads=False, prepost=False)
+            p = yahoo_last_close(t)
+            if p is not None:
+                result_stocks[t] = p
         except Exception:
-            df = None
-    if df is None or df.empty:
-        raise HTTPException(status_code=404, detail="Κενό αποτέλεσμα.")
-    candles = []
-    for ts, row in df.iterrows():
-        candles.append({
-            "t": _ts_to_ms(ts.to_pydatetime()),
-            "o": float(row["Open"]),
-            "h": float(row["High"]),
-            "l": float(row["Low"]),
-            "c": float(row["Close"]),
-            "v": float(row.get("Volume", 0) or 0),
-        })
-    return {"symbol": sym, "interval": interval, "range": range, "candles": candles}
+            pass
 
-# ---------- Forex ----------
-@app.get("/forex/price/{pair}")
-def forex_price(pair: str):
-    p = pair.upper().replace("/", "")
-    ysym = f"{p}=X"
-    price, _ = yf_last_price(ysym)
-    return {"pair": pair.upper(), "price": price}
+    # News
+    articles = newsapi_top_business(limit=news_limit, lang=lang)
 
-# ---------- Commodities ----------
-@app.get("/commodity/price/{name}")
-def commodity_price(name: str):
-    m = {
-        "GOLD": "GC=F",
-        "SILVER": "SI=F",
-        "WTI": "CL=F",
-        "BRENT": "BZ=F",
-        "NATGAS": "NG=F",
+    snapshot = {
+        "crypto": crypto,
+        "stocks": result_stocks,
+        "news": [
+            {"title": a.get("title"), "source": (a.get("source") or {}).get("name")}
+            for a in articles
+        ],
     }
-    key = name.upper()
-    sym = m.get(key)
-    if not sym:
-        raise HTTPException(status_code=400, detail="Υποστήριξη: GOLD, SILVER, WTI, BRENT, NATGAS.")
-    price, _ = yf_last_price(sym)
-    return {"commodity": key, "symbol": sym, "price": price}
+
+    summary = ai_summarize(snapshot)
+    return {"data": snapshot, "ai_summary": summary}
+

@@ -1,72 +1,133 @@
-from fastapi import FastAPI, Body, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse
 import os
-from typing import Any, Dict, List, Optional
-import httpx
-import csv
-from io import StringIO
+import json
+from typing import List, Optional
 
-# -----------------------------
-# App & Config (MUST be first)
-# -----------------------------
+import requests
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+# ==== FastAPI App ====
 app = FastAPI(title="AI Markets")
 
-OPENAI_API_KEY = (
-    os.getenv("OPENAI_API_KEY")
-    or os.getenv("OPENAIKEY")
-    or os.getenv("OPEN_AI_KEY")
-)
+# Static / Templates
+# (δημιούργησε φάκελο app/templates με το advisor.html από κάτω)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
-# OpenAI (new SDK)
-try:
-    from openai import OpenAI  # pip install openai>=1.40
-    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception:
-    openai_client = None
+# ==== Utilities ====
+
+def get_env_openai_key() -> Optional[str]:
+    """
+    Παίρνει το OpenAI API key από διάφορα πιθανά ονόματα env var
+    γιατί τα είδαμε σε διαφορετικές μορφές στα screenshots.
+    """
+    candidates = [
+        "OPENAI_KEY",
+        "OPEN_AI_KEY",
+        "OPENAI_API_KEY",
+        "OPENAIKEY",
+        "OPENAI"
+    ]
+    for name in candidates:
+        val = os.getenv(name)
+        if val and val.strip():
+            return val.strip()
+    return None
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-HTTP_TIMEOUT = 12.0
+def fetch_stock_price_yahoo(symbol: str) -> Optional[float]:
+    """
+    Προσπαθεί να φέρει τιμή με ένα απλό endpoint του Yahoo (μη επίσημο).
+    Αν δεν δουλέψει, επιστρέφει None (θα χειριστούμε graceful fail).
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        quote = data.get("quoteResponse", {}).get("result", [])
+        if not quote:
+            return None
+        price = quote[0].get("regularMarketPrice")
+        return float(price) if price is not None else None
+    except Exception:
+        return None
 
 
-async def fetch_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url, params=params)
+def fetch_crypto_price_coingecko(ids: List[str], vs="usd") -> dict:
+    """
+    Δωρεάν CoinGecko simple price (χωρίς κλειδί).
+    ids: π.χ. ["bitcoin","ethereum"]
+    """
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {"ids": ",".join(ids), "vs_currencies": vs}
+        r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         return r.json()
+    except Exception:
+        return {}
 
 
-async def fetch_text(url: str, params: Optional[Dict[str, Any]] = None) -> str:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url, params=params)
+def fetch_fx_price_exchangerate(base: str, quote: str) -> Optional[float]:
+    """
+    Δωρεάν exchangerate.host
+    """
+    try:
+        url = f"https://api.exchangerate.host/latest?base={base.upper()}&symbols={quote.upper()}"
+        r = requests.get(url, timeout=12)
         r.raise_for_status()
-        return r.text
+        data = r.json()
+        rate = data.get("rates", {}).get(quote.upper())
+        return float(rate) if rate is not None else None
+    except Exception:
+        return None
 
 
-def ok(data: Any) -> Dict[str, Any]:
-    return {"ok": True, "data": data}
+def fetch_news_yahoo(tickers: List[str], limit: int = 5, lang: str = "en") -> List[dict]:
+    """
+    Πολύ απλό aggregator: τραβάει Yahoo Finance RSS ανά ticker.
+    Χωρίς κλειδί. Επιστρέφει λίστα άρθρων (τίτλος, link).
+    """
+    import xml.etree.ElementTree as ET
+
+    items = []
+    for symbol in tickers:
+        try:
+            rss = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang={lang}"
+            r = requests.get(rss, timeout=10)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            for item in root.iter("item"):
+                title = item.findtext("title") or ""
+                link = item.findtext("link") or ""
+                if title and link:
+                    items.append({"symbol": symbol.upper(), "title": title, "link": link})
+        except Exception:
+            continue
+        if len(items) >= limit:
+            break
+    return items[:limit]
 
 
-def fail(msg: str, status: int = 502):
-    raise HTTPException(status, msg)
+# ==== Routes ====
 
-
-# -----------------------------
-# Basic endpoints
-# -----------------------------
-@app.get("/", response_class=PlainTextResponse)
-def home():
-    return (
-        "AI Markets is running.\n\n"
-        "Try:\n"
-        "  /healthz\n"
-        "  /crypto/price/bitcoin\n"
-        "  /stock/price/AAPL\n"
-        "  /forex/price/EURUSD\n"
-        "  /advisor (simple UI)\n"
-    )
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request):
+    """Landing με links."""
+    html = """
+    <h3>AI Markets is running.</h3>
+    <p>Try: <a href="/healthz">/healthz</a>, 
+    <a href="/stock/price/AAPL">/stock/price/AAPL</a>, 
+    <a href="/crypto/price/bitcoin">/crypto/price/bitcoin</a>, 
+    <a href="/forex/price?base=USD&quote=EUR">/forex/price?base=USD&quote=EUR</a>, 
+    <a href="/news?tickers=AAPL,MSFT&limit=5&lang=en">/news</a>,
+    <a href="/advisor">/advisor</a></p>
+    """
+    return HTMLResponse(html)
 
 
 @app.get("/healthz")
@@ -74,236 +135,122 @@ def healthz():
     return {"ok": True}
 
 
-# -----------------------------
-# Data endpoints (free providers)
-# -----------------------------
+# ---- Stocks ----
+@app.get("/stock/price/{symbol}")
+def stock_price(symbol: str):
+    price = fetch_stock_price_yahoo(symbol)
+    if price is None:
+        return JSONResponse({"detail": "No price found."}, status_code=404)
+    return {"symbol": symbol.upper(), "price": price}
+
+
+# ---- Crypto ----
 @app.get("/crypto/price/{coin_id}")
-async def crypto_price(coin_id: str):
-    """
-    Free source: CoinGecko Simple Price (no key required).
-    Example: /crypto/price/bitcoin
-    """
-    try:
-        data = await fetch_json(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": coin_id.lower(), "vs_currencies": "usd"},
-        )
-        if coin_id.lower() not in data:
-            return ok({"id": coin_id, "usd": None, "note": "coin not found"})
-        return ok({"id": coin_id, "usd": data[coin_id.lower()]["usd"]})
-    except Exception as e:
-        fail(f"coingecko error: {e}")
+def crypto_price(coin_id: str, vs: str = "usd"):
+    data = fetch_crypto_price_coingecko([coin_id], vs=vs)
+    if not data or coin_id not in data or vs not in data[coin_id]:
+        return JSONResponse({"detail": "CoinGecko error."}, status_code=502)
+    return {"coin": coin_id, "vs": vs, "price": data[coin_id][vs]}
 
 
-@app.get("/stock/price/{ticker}")
-async def stock_price(ticker: str):
-    """
-    Free source: Stooq (CSV). We try {TICKER}.US e.g., AAPL.US
-    Example: /stock/price/AAPL
-    """
-    sym = f"{ticker.upper()}.US"
-    url = "https://stooq.com/q/l/"
-    params = {"s": sym, "i": "d"}
-    try:
-        txt = await fetch_text(url, params=params)
-        # CSV like: Symbol,Date,Time,Open,High,Low,Close,Volume
-        # AAPL.US,2024-08-09,22:00:09,XXXX,XXXX,XXXX,189.97,xxxxx
-        f = StringIO(txt)
-        rows = list(csv.reader(f))
-        if len(rows) >= 2 and rows[1][0].upper() == sym.upper():
-            close_str = rows[1][6]
-            price = float(close_str) if close_str not in ("N/D", "N/A", "") else None
-            return ok({"ticker": ticker.upper(), "price": price, "source": "stooq"})
-        return ok({"ticker": ticker.upper(), "price": None, "note": "not found"})
-    except Exception as e:
-        fail(f"stooq error: {e}")
+# ---- Forex ----
+@app.get("/forex/price")
+def fx_price(base: str = "USD", quote: str = "EUR"):
+    rate = fetch_fx_price_exchangerate(base, quote)
+    if rate is None:
+        return JSONResponse({"detail": "No FX rate found."}, status_code=404)
+    return {"base": base.upper(), "quote": quote.upper(), "rate": rate}
 
 
-@app.get("/forex/price/{pair}")
-async def forex_price(pair: str):
-    """
-    Free source: exchangerate.host convert endpoint.
-    Example: /forex/price/EURUSD (FROM=EUR, TO=USD)
-    """
-    pair = pair.upper().strip().replace("/", "")
-    if len(pair) != 6:
-        fail("pair must be like EURUSD", 400)
-    base, quote = pair[:3], pair[3:]
-    try:
-        data = await fetch_json(
-            "https://api.exchangerate.host/convert",
-            params={"from": base, "to": quote},
-        )
-        return ok({"pair": pair, "rate": data.get("result")})
-    except Exception as e:
-        fail(f"fx error: {e}")
+# ---- News ----
+@app.get("/news")
+def news(tickers: str = "AAPL", limit: int = 5, lang: str = "en"):
+    tick_list = [t.strip() for t in tickers.split(",") if t.strip()]
+    items = fetch_news_yahoo(tick_list, limit=limit, lang=lang)
+    return {"count": len(items), "items": items}
 
 
-# -----------------------------
-# AI endpoints (chat + advisor UI)
-# -----------------------------
-SYSTEM_PROMPT = (
-    "You are an investment research assistant. Be helpful, concise, and neutral. "
-    "You can discuss crypto, stocks, ETFs, forex and macro news. "
-    "Always include a disclaimer that this is not financial advice."
-)
-
-
-@app.post("/chat")
-async def chat(payload: Dict[str, Any] = Body(...)):
-    """
-    Generic chat endpoint that can accept:
-    {
-      "question": "text",           (free-form question)
-      "tickers": "AAPL,MSFT,SPY",   (optional)
-      "coins": "bitcoin,ethereum",  (optional)
-      "news_limit": 5,              (ignored for now)
-      "lang": "en"
-    }
-    It fetches some live prices and passes context to the LLM.
-    """
-    if not openai_client:
-        fail("AI is not configured (set OPENAI_API_KEY).", 400)
-
-    question: str = (payload.get("question") or "").strip()
-    tickers_raw: str = (payload.get("tickers") or "").strip()
-    coins_raw: str = (payload.get("coins") or "").strip()
-    lang: str = (payload.get("lang") or "en").strip()
-
-    if not question:
-        fail("question is required", 400)
-
-    tickers: List[str] = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-    coins: List[str] = [c.strip().lower() for c in coins_raw.split(",") if c.strip()]
-
-    # gather minimal live context
-    context_lines: List[str] = []
-
-    # stocks
-    for t in tickers[:8]:
-        try:
-            sp = await stock_price(t)
-            context_lines.append(f"Stock {t} price (stooq): {sp['data']['price']}")
-        except Exception:
-            context_lines.append(f"Stock {t} price: unavailable")
-
-    # crypto
-    for c in coins[:8]:
-        try:
-            cp = await crypto_price(c)
-            context_lines.append(f"Crypto {c} price (usd): {cp['data']['usd']}")
-        except Exception:
-            context_lines.append(f"Crypto {c} price: unavailable")
-
-    context = "\n".join(context_lines) if context_lines else "No live prices fetched."
-
-    user_prompt = (
-        f"Language: {lang}\n"
-        f"User question: {question}\n\n"
-        f"Available live data:\n{context}\n\n"
-        "Please provide a short, structured research answer with:\n"
-        "- Key points\n- Pros & cons\n- Simple next steps or what to watch\n"
-        "Finish with a disclaimer that this is educational research, not financial advice."
-    )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    try:
-        # OpenAI "Responses" API
-        resp = openai_client.responses.create(
-            model="gpt-5-mini",
-            input=[{"role": m["role"], "content": m["content"]} for m in messages],
-        )
-        reply = getattr(resp, "output_text", "").strip() or "No AI output."
-        return {"ok": True, "reply": reply}
-    except Exception as e:
-        fail(f"AI error: {e}")
-
-
-# -----------------------------
-# Simple advisor UI page
-# -----------------------------
-ADVISOR_HTML = """<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<title>AI Markets Advisor</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; max-width: 900px; margin: 0 auto;}
-  input, textarea { width: 100%; padding: 10px; margin: 6px 0 12px; font-size: 15px; box-sizing: border-box; }
-  button { padding: 10px 16px; font-size: 15px; cursor: pointer; }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  pre { background: #f6f7f9; padding: 14px; border-radius: 8px; white-space: pre-wrap;}
-</style>
-<h2>AI Markets Advisor</h2>
-<p>Ask in free form (e.g., "Where should I invest today given high rates?"). This is educational research, not financial advice.</p>
-
-<label>Your question</label>
-<textarea id="q" rows="4" placeholder="e.g., Where should I invest today?"></textarea>
-
-<div class="row">
-  <div>
-    <label>Stocks/ETFs (comma separated tickers)</label>
-    <input id="tickers" placeholder="AAPL,MSFT,SPY" />
-  </div>
-  <div>
-    <label>Coins (comma separated ids)</label>
-    <input id="coins" placeholder="bitcoin,ethereum" />
-  </div>
-</div>
-
-<div class="row">
-  <div>
-    <label>News limit (not used yet)</label>
-    <input id="news" value="5" />
-  </div>
-  <div>
-    <label>Language</label>
-    <input id="lang" value="en" />
-  </div>
-</div>
-
-<button id="go">Analyze</button>
-
-<h3>Result</h3>
-<pre id="out"></pre>
-
-<script>
-async function callChat() {
-  const out = document.getElementById('out');
-  out.textContent = "Working...";
-  const payload = {
-    question: document.getElementById('q').value,
-    tickers: document.getElementById('tickers').value,
-    coins: document.getElementById('coins').value,
-    news_limit: Number(document.getElementById('news').value || 5),
-    lang: document.getElementById('lang').value || 'en'
-  };
-  try {
-    const r = await fetch('/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
-    });
-    const j = await r.json();
-    if (!j.ok) {
-      out.textContent = "Error: " + JSON.stringify(j);
-    } else {
-      out.textContent = j.reply || JSON.stringify(j);
-    }
-  } catch (e) {
-    out.textContent = "AI error: " + e;
-  }
-}
-document.getElementById('go').addEventListener('click', callChat);
-</script>
-</html>
-"""
-
+# ---- Advisor page (UI) ----
 @app.get("/advisor", response_class=HTMLResponse)
-def advisor_page():
-    return ADVISOR_HTML
+def advisor_page(request: Request):
+    return templates.TemplateResponse("advisor.html", {"request": request})
+
+
+# ---- Advisor API (OpenAI) ----
+@app.post("/api/advice")
+async def api_advice(payload: dict):
+    """
+    payload: {
+      "question": str,
+      "stocks": "AAPL,MSFT",
+      "coins": "bitcoin,ethereum",
+      "newsLimit": 5,
+      "newsLang": "en"
+    }
+    """
+    question = (payload.get("question") or "").strip()
+    stocks = [s.strip() for s in (payload.get("stocks") or "").split(",") if s.strip()]
+    coins  = [c.strip() for c in (payload.get("coins") or "").split(",") if c.strip()]
+    news_limit = int(payload.get("newsLimit") or 5)
+    news_lang  = (payload.get("newsLang") or "en").strip() or "en"
+
+    # Μαζεύουμε δεδομένα
+    stock_data = []
+    for s in stocks:
+        p = fetch_stock_price_yahoo(s)
+        if p is not None:
+            stock_data.append({"symbol": s.upper(), "price": p})
+
+    crypto_data = {}
+    if coins:
+        cg = fetch_crypto_price_coingecko(coins, vs="usd")
+        for cid in coins:
+            val = cg.get(cid, {}).get("usd")
+            if val is not None:
+                crypto_data[cid] = val
+
+    headlines = fetch_news_yahoo(stocks or ["AAPL"], limit=news_limit, lang=news_lang)
+
+    # Prompt για OpenAI
+    openai_key = get_env_openai_key()
+    if not openai_key:
+        # Αν δεν έχουμε κλειδί, επιστρέφουμε μια "ανθρώπινη" σύνοψη
+        return {
+            "ai_summary": "OpenAI key not configured. Here is a simple summary.",
+            "stocks": stock_data,
+            "crypto": crypto_data,
+            "news": headlines,
+        }
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+
+        context = {
+            "question": question,
+            "stocks": stock_data,
+            "crypto": crypto_data,
+            "news": headlines,
+            "disclaimer": "Educational research only. Not financial advice."
+        }
+
+        # Μικρό, οικονομικό μοντέλο για περίληψη
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful markets research assistant. Provide clear, practical, balanced insights. Never give financial advice; include a short disclaimer."},
+                {"role": "user", "content": f"Summarize the following context and answer the user's question. Context JSON:\n{json.dumps(context, ensure_ascii=False)}"}
+            ],
+            temperature=0.3
+        )
+        summary = completion.choices[0].message.content.strip() if completion and completion.choices else "No summary."
+
+        return {
+            "ai_summary": summary,
+            "stocks": stock_data,
+            "crypto": crypto_data,
+            "news": headlines,
+        }
+    except Exception as e:
+        return JSONResponse({"detail": f"AI error: {str(e)}"}, status_code=502)
 

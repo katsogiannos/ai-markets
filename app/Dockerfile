@@ -1,16 +1,18 @@
 FROM python:3.11-slim
 
+# Όλα θα τρέχουν μέσα στον /app
 WORKDIR /app
 
-COPY requirements.txt .
+# Επειδή τα αρχεία είναι κάτω από τον φάκελο app στο repo,
+# τα αντιγράφουμε ρητά από εκεί.
+COPY app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Αντιγράφουμε ΟΛΟ το περιεχόμενο του repo (ώστε να βρει templates κλπ)
-COPY . /app
+# Αντέγραψε όλο το app/
+COPY app/ ./
 
-# Render δίνει PORT (default 10000). Το EXPOSE είναι πληροφοριακό.
-ENV PORT=10000
+# Render δίνει PORT (συνήθως 10000)
 EXPOSE 10000
 
-# Τρέχουμε uvicorn πάνω στο app/main.py (module: app.main:app)
-CMD ["bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Εκκίνηση uvicorn
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]

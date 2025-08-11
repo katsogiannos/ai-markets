@@ -1,17 +1,16 @@
-# Χρησιμοποιούμε Python 3.11
-FROM python:3.11
+FROM python:3.11-slim
 
-# Ορίζουμε φάκελο εργασίας
 WORKDIR /app
 
-# Αντιγράφουμε το requirements.txt
 COPY requirements.txt .
-
-# Εγκαθιστούμε dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Αντιγράφουμε όλο τον κώδικα
+# Αντιγράφουμε ΟΛΟ το περιεχόμενο του repo (ώστε να βρει templates κλπ)
 COPY . /app
 
-# Τρέχουμε την εφαρμογή
-CMD ["python", "main.py"]
+# Render δίνει PORT (default 10000). Το EXPOSE είναι πληροφοριακό.
+ENV PORT=10000
+EXPOSE 10000
+
+# Τρέχουμε uvicorn πάνω στο app/main.py (module: app.main:app)
+CMD ["bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-10000}"]

@@ -1,13 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import yfinance as yf
+import httpx, yfinance as yf
 from datetime import datetime, timezone
 
 app = FastAPI(title="AI Markets – MVP")
 
-# CORS (ώστε να το δεις κι από browser/app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,22 +21,33 @@ def health():
 def home():
     return "It works ✅"
 
-# ------------------- Helpers -------------------
+# ---------- Helpers ----------
 def _ts_to_ms(ts: datetime) -> int:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return int(ts.timestamp() * 1000)
 
-def _yf_pair(pair: str) -> str:
-    """EURUSD -> EURUSD=X (Yahoo Finance)"""
-    p = pair.upper().replace("/", "")
-    if not (len(p) in (6,7)):  # πρόχειρος έλεγχος
-        raise HTTPException(status_code=400, detail="Δώσε π.χ. EURUSD ή GBPUSD")
-    if p.endswith("=X"):
-        return p
-    return f"{p}=X"
+def yf_last_price(symbol: str):
+    """Πάρε τιμή με 2 προσπάθειες: fast_info -> history."""
+    t = yf.Ticker(symbol)
+    # 1) fast_info
+    try:
+        fi = t.fast_info
+        p = fi.get("last_price")
+        if p is not None:
+            return float(p), fi.get("currency", "USD")
+    except Exception:
+        pass
+    # 2) τελευταία τιμή από history
+    try:
+        h = t.history(period="1d", interval="1d", auto_adjust=False, actions=False)
+        if h is not None and not h.empty:
+            return float(h["Close"][-1]), "USD"
+    except Exception:
+        pass
+    raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή.")
 
-# ------------------- Crypto (CoinGecko) -------------------
+# ---------- Crypto (CoinGecko) ----------
 @app.get("/crypto/price/{symbol}")
 async def crypto_price(symbol: str):
     mapping = {
@@ -46,15 +55,20 @@ async def crypto_price(symbol: str):
         "eth": "ethereum", "ethereum": "ethereum",
         "sol": "solana", "solana": "solana",
         "ada": "cardano", "cardano": "cardano",
-        "xrp": "ripple", "ripple": "ripple",
+        "xrp": "ripple",  "ripple": "ripple",
     }
     coin_id = mapping.get(symbol.lower())
     if not coin_id:
         raise HTTPException(status_code=400, detail="Υποστήριξη: BTC, ETH, SOL, ADA, XRP.")
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coin_id, "vs_currencies": "usd"}
+    headers = {
+        # Κάποιοι providers θέλουν User-Agent
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, headers=headers) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
@@ -65,28 +79,30 @@ async def crypto_price(symbol: str):
         raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή.")
     return {"symbol": symbol.upper(), "usd": price}
 
-# ------------------- Stocks / ETFs (Yahoo Finance) -------------------
+# ---------- Stocks / ETFs ----------
 @app.get("/stock/price/{symbol}")
 def stock_price(symbol: str):
-    t = yf.Ticker(symbol.upper())
-    try:
-        fi = t.fast_info
-        price = float(fi["last_price"])
-        currency = fi.get("currency", "USD")
-    except Exception:
-        raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή (σύμβολο;).")
-    return {"symbol": symbol.upper(), "price": price, "currency": currency}
+    price, ccy = yf_last_price(symbol.upper())
+    return {"symbol": symbol.upper(), "price": price, "currency": ccy}
 
 @app.get("/stock/candles/{symbol}")
 def stock_candles(symbol: str, interval: str = "1d", range: str = "1mo"):
     """
-    interval: 1m, 2m, 5m, 15m, 1h, 1d, 1wk, 1mo
+    interval: 1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo
     range: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
     """
+    sym = symbol.upper()
+    # δοκίμασε history (πιο αξιόπιστο στο Render)
     try:
-        df = yf.download(symbol.upper(), period=range, interval=interval, progress=False)
+        df = yf.Ticker(sym).history(period=range, interval=interval, auto_adjust=False, actions=False)
     except Exception:
-        raise HTTPException(status_code=502, detail="Πρόβλημα λήψης δεδομένων.")
+        df = None
+    if df is None or df.empty:
+        # δεύτερη προσπάθεια με download
+        try:
+            df = yf.download(sym, period=range, interval=interval, progress=False, threads=False, prepost=False)
+        except Exception:
+            df = None
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail="Κενό αποτέλεσμα.")
     candles = []
@@ -99,20 +115,17 @@ def stock_candles(symbol: str, interval: str = "1d", range: str = "1mo"):
             "c": float(row["Close"]),
             "v": float(row.get("Volume", 0) or 0),
         })
-    return {"symbol": symbol.upper(), "interval": interval, "range": range, "candles": candles}
+    return {"symbol": sym, "interval": interval, "range": range, "candles": candles}
 
-# ------------------- Forex (Yahoo Finance) -------------------
+# ---------- Forex ----------
 @app.get("/forex/price/{pair}")
 def forex_price(pair: str):
-    ysym = _yf_pair(pair)
-    t = yf.Ticker(ysym)
-    try:
-        price = float(t.fast_info["last_price"])
-    except Exception:
-        raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή.")
+    p = pair.upper().replace("/", "")
+    ysym = f"{p}=X"
+    price, _ = yf_last_price(ysym)
     return {"pair": pair.upper(), "price": price}
 
-# ------------------- Commodities (Yahoo Finance) -------------------
+# ---------- Commodities ----------
 @app.get("/commodity/price/{name}")
 def commodity_price(name: str):
     m = {
@@ -126,9 +139,5 @@ def commodity_price(name: str):
     sym = m.get(key)
     if not sym:
         raise HTTPException(status_code=400, detail="Υποστήριξη: GOLD, SILVER, WTI, BRENT, NATGAS.")
-    t = yf.Ticker(sym)
-    try:
-        price = float(t.fast_info["last_price"])
-    except Exception:
-        raise HTTPException(status_code=502, detail="Δεν βρέθηκε τιμή.")
+    price, _ = yf_last_price(sym)
     return {"commodity": key, "symbol": sym, "price": price}

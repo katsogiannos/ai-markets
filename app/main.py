@@ -91,3 +91,18 @@ async def debug_openai():
         return {"status": r.status_code, "body": r.text[:500]}
     except Exception as e:
         return {"status": "request_failed", "error": str(e)}
+from fastapi import FastAPI
+import openai
+import os
+
+app = FastAPI()
+
+@app.get("/debug-openai")
+async def debug_openai():
+    try:
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        # Δοκιμή με ένα πολύ απλό request
+        response = openai.models.list()
+        return {"status": "ok", "body": response.data}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}

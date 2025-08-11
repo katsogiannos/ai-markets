@@ -78,3 +78,16 @@ async def advisor_get(
 
 @app.post("/advisor")                      # POST /advisor {query:"..."}
 async def advisor_post(payload: Dict[str, Any]): return await _handle_advice(payload)
+@app.get("/debug-openai")
+async def debug_openai():
+    import httpx, json, os
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        return {"status": r.status_code, "body": r.text[:500]}
+    except Exception as e:
+        return {"status": "request_failed", "error": str(e)}

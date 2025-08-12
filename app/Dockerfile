@@ -1,18 +1,19 @@
+# app/Dockerfile
 FROM python:3.11-slim
 
-# Όλα θα τρέχουν μέσα στον /app
+# Όλα να τρέχουν μέσα στον /app
 WORKDIR /app
 
-# Επειδή τα αρχεία είναι κάτω από τον φάκελο app στο repo,
-# τα αντιγράφουμε ρητά από εκεί.
+# Εγκατάσταση deps (ξεχωρίζουμε requirements για καλύτερο layer caching)
 COPY app/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Αντέγραψε όλο το app/
+# Αντιγραφή όλου του κώδικα στο /app
 COPY app/ ./
 
-# Render δίνει PORT (συνήθως 10000)
+# Render (Docker) απαιτεί να ακούς στο 10000
 EXPOSE 10000
+ENV PYTHONUNBUFFERED=1
 
-# Εκκίνηση uvicorn
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Εκκίνηση uvicorn στο σταθερό port 10000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]

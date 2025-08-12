@@ -1,21 +1,27 @@
 # app/main.py
 from __future__ import annotations
 import os
+import logging
 from typing import Optional
+
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, constr
 
-# γιατί: νέο OpenAI SDK v1
+# --- logging: δείξε exceptions/traceback στα Render logs ---
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(asctime)s %(name)s: %(message)s")
+logger = logging.getLogger("ai-markets")
+
+# OpenAI SDK v1
 try:
     from openai import OpenAI
 except Exception as exc:
-    raise RuntimeError("Λείπει/παλιά έκδοση του πακέτου 'openai' v1.") from exc
+    raise RuntimeError("Απαιτείται το πακέτο 'openai' v1+") from exc
 
 load_dotenv()
 
-app = FastAPI(title="AI Markets Advice API", version="1.0.0")
+app = FastAPI(title="AI Markets Advice API", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +47,8 @@ class AdviceResponse(BaseModel):
 def get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        # γιατί: εμφανές σφάλμα όταν λείπει το key
+        logger.error("OPENAI_API_KEY is missing in environment")
         raise HTTPException(status_code=401, detail="Λείπει το OPENAI_API_KEY.")
     return OpenAI(api_key=api_key)
 
@@ -54,7 +62,7 @@ SYSTEM_PROMPT = (
 
 @app.get("/")
 def root() -> dict:
-    return {"ok": True, "service": "ai-markets", "version": "1.0.0"}
+    return {"ok": True, "service": "ai-markets", "version": "1.0.1"}
 
 @app.get("/health")
 def health() -> dict:
@@ -62,13 +70,23 @@ def health() -> dict:
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"status": "ok"}  # γιατί: Render default health check
+    return {"status": "ok"}  # Render health check
+
+# --- μικρό debug endpoint: ΔΕΝ δείχνει μυστικά, μόνο αν υπάρχουν ---
+@app.get("/debug/env")
+def debug_env() -> dict:
+    return {
+        "has_OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+        "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    }
 
 @app.post("/advice", response_model=AdviceResponse)
 def get_advice(payload: AdviceRequest, client: OpenAI = Depends(get_openai_client)) -> AdviceResponse:
     try:
+        logger.info("Advice request received | model=%s risk=%s", payload.model, payload.risk_profile or "unspecified")
         system_msg = SYSTEM_PROMPT.format(lang=payload.language or "el")
         user_msg = _build_user_message(payload)
+
         completion = client.chat.completions.create(
             model=payload.model,
             messages=[
@@ -81,11 +99,15 @@ def get_advice(payload: AdviceRequest, client: OpenAI = Depends(get_openai_clien
         )
         content = (completion.choices[0].message.content or "").strip()
         if not content:
+            logger.error("Empty response from OpenAI")
             raise HTTPException(status_code=502, detail="Κενή απάντηση από το μοντέλο.")
         return AdviceResponse(answer=content, model=payload.model)
+
     except HTTPException:
         raise
     except Exception as exc:
+        # γιατί: να δούμε ακριβώς το λάθος στο Render logs
+        logger.exception("OpenAI call failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"AI error: {exc!s}") from exc
 
 def _build_user_message(p: AdviceRequest) -> str:
@@ -99,5 +121,5 @@ def _build_user_message(p: AdviceRequest) -> str:
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))  # γιατί: Render ορίζει PORT
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

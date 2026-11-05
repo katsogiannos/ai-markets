@@ -15,9 +15,7 @@ import (
  "sort"
  "strings"
  "sync"
- "syscall"
  "time"
- "unsafe"
 
  "github.com/danieljoos/wincred"
  "github.com/lxn/walk"
@@ -200,16 +198,10 @@ func display(){
   label:="ΝΕΑ ΠΑΡΑΓΓΕΛΙΑ"
   if o.IsTest{label="ΔΟΚΙΜΑΣΤΙΚΗ ΕΙΔΟΠΟΙΗΣΗ"}
   var detail strings.Builder
-  detail.WriteString(o.CustomerName+"  "+o.CustomerPhone+"
-
-")
-  for _,item:=range o.Items{fmt.Fprintf(&detail,"%v × %s
-",item.Qty,item.Name)}
-  if o.Notes!=""{detail.WriteString("
-Σχόλια: "+o.Notes+"
-")}
-  fmt.Fprintf(&detail,"
-Σύνολο: %.2f €",o.Total)
+  detail.WriteString(o.CustomerName+"  "+o.CustomerPhone+"\n\n")
+  for _,item:=range o.Items{fmt.Fprintf(&detail,"%v × %s\n",item.Qty,item.Name)}
+  if o.Notes!=""{detail.WriteString("\nΣχόλια: "+o.Notes+"\n")}
+  fmt.Fprintf(&detail,"\nΣύνολο: %.2f €",o.Total)
   var dlg *walk.Dialog
   _,err:=(Dialog{
    AssignTo:&dlg,

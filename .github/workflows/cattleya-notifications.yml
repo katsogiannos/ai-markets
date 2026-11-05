@@ -1,0 +1,31 @@
+name: Cattleya Notifications Windows Installer
+on:
+  push:
+    branches:
+      - cattleya-notifications-setup
+    paths:
+      - 'cattleya-notifications/**'
+      - '.github/workflows/cattleya-notifications.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build Windows installer
+        run: |
+          cd cattleya-notifications
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 GO111MODULE=off go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../CattleyaNotificationsSetup.exe .
+          test -s ../CattleyaNotificationsSetup.exe
+          file ../CattleyaNotificationsSetup.exe
+      - name: Publish Windows installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete cattleya-notifications-v2.0.0 --yes --cleanup-tag || true
+          gh release create cattleya-notifications-v2.0.0 CattleyaNotificationsSetup.exe --target "$GITHUB_SHA" --title "Cattleya Notifications Windows v2.0" --notes "Windows 10/11 installer. SHA256: $(sha256sum CattleyaNotificationsSetup.exe | cut -d' ' -f1). Requires explicit user execution; unsigned executable." --latest=false
